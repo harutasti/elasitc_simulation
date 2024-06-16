@@ -3,54 +3,54 @@ import taichi as ti  # import taichi
 ti.init(arch=ti.gpu)  # initialize taichi,try to use GPU
 
 # simulation's parameters
-n_particles = 8192  # number of particles 〇
-n_grid = 128  # number of grids　〇
-dx = 1 / n_grid  # grid's width　〇
+n_particles = 8192  # number of particles
+n_grid = 128  # number of grids　
+dx = 1 / n_grid  # grid's width　
 inv_dx = 1 / dx  # inverse of grid's width
-dt = 2e-4  # time step　〇
-gravity = 9.8  # gravity　〇
+dt = 2e-4  # time step　
+gravity = 9.8  # gravity　
 bound = 3  # boundary
 
 the_c = 2.5e-2  # critical compression
 the_s = 5.0e-3  # critical stretch
 xi = 5  # hardening coefficient
-p_rho = 4e2  # particle's density　〇
-E = 1.4e5  # Young's modulus　〇
-nu = 0.45  # Poisson's ratio　〇
-mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))  # Lame parameters　〇
+p_rho = 4e2  # particle's density　
+E = 1.4e5  # Young's modulus　
+nu = 0.45  # Poisson's ratio　
+mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))  # Lame parameters　
 
-p_vol = (dx * 0.5) ** 2  # particle's volume　〇
-p_mass = p_vol * p_rho  # particle's mass 〇
+p_vol = (dx * 0.5) ** 2  # particle's volume　
+p_mass = p_vol * p_rho  # particle's mass
 
 # particle's parameters
-x = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # position 〇
-v = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # velocity　〇
-C = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # Affine matrix　〇
-F = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # elastic deformation gradient 〇
+x = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # position
+v = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # velocity　
+C = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # Affine matrix　
+F = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # elastic deformation gradient
 Fp = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # plastic deformation gradient
 # J = ti.field(dtype=float, shape=n_particles) #Jacobian determinant
-Jp = ti.field(dtype=float, shape=n_particles)  # plastic deformation　〇
+Jp = ti.field(dtype=float, shape=n_particles)  # plastic deformation　
 
 # grid's mv and mass
-grid_v = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))  # 〇
-grid_m = ti.field(dtype=float, shape=(n_grid, n_grid))  # 〇
-grid_f = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))  # 〇
+grid_v = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))
+grid_m = ti.field(dtype=float, shape=(n_grid, n_grid))
+grid_f = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))
 
 
 @ti.kernel
 def substep():
-    # reset grid's velocity and mass 〇
+    # reset grid's velocity and mass
     for i, j in grid_m:
         grid_v[i, j] = [0, 0]
         grid_m[i, j] = 0
 
     # Particle to grid: particle's mass and velocity to grid's mass and velocity
     for p in x:
-        Xp = x[p] * inv_dx  # particle's position in grid　〇
-        base = int(Xp - 0.5).cast(int)  # the left bottom grid of particle　〇
-        fx = x[p] * inv_dx - base.cast(float)  # the distance between particle and the left bottom grid　〇
-        w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]  # weight,use quadratic interpolation　〇
-        dw = [fx - 1.5, -2.0 * (fx - 1), fx - 0.5]  # weight's derivative　〇
+        Xp = x[p] * inv_dx  # particle's position in grid　
+        base = int(Xp - 0.5).cast(int)  # the left bottom grid of particle　
+        fx = x[p] * inv_dx - base.cast(float)  # the distance between particle and the left bottom grid　
+        w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]  # weight,use quadratic interpolation　
+        dw = [fx - 1.5, -2.0 * (fx - 1), fx - 0.5]  # weight's derivative　
         mu, la = mu_0, lambda_0  # Lame parameters: with h
         affine = C[p]
         J = 1.0
