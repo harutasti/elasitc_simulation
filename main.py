@@ -1,69 +1,156 @@
-import pybullet as p
-import pybullet_data
-import time
-import numpy as np
+import taichi as ti  # import taichi
 
-# シミュレーションの初期化
-p.connect(p.GUI)
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
+ti.init(arch=ti.gpu)  # initialize taichi,try to use GPU
 
-# 重力の設定
-p.setGravity(0, 0, -9.8)
+# simulation's parameters
+n_particles = 8192  # number of particles 〇
+n_grid = 128  # number of grids　〇
+dx = 1 / n_grid  # grid's width　〇
+inv_dx = 1 / dx  # inverse of grid's width
+dt = 2e-4  # time step　〇
+gravity = 9.8  # gravity　〇
+bound = 3  # boundary
 
-# 地面の追加
-plane_id = p.loadURDF("plane.urdf")
+the_c = 2.5e-2  # critical compression
+the_s = 5.0e-3  # critical stretch
+xi = 5  # hardening coefficient
+p_rho = 4e2  # particle's density　〇
+E = 1.4e5  # Young's modulus　〇
+nu = 0.45  # Poisson's ratio　〇
+mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))  # Lame parameters　〇
 
-# 弾性体を構成する粒子のパラメータ
-particle_radius = 0.05
-particle_mass = 1.0
-num_particles_x = 5
-num_particles_y = 5
+p_vol = (dx * 0.5) ** 2  # particle's volume　〇
+p_mass = p_vol * p_rho  # particle's mass 〇
 
-# 粒子の初期配置
-particle_ids = []
-positions = []
-for i in range(num_particles_x):
-    for j in range(num_particles_y):
-        pos = [i * 2 * particle_radius, j * 2 * particle_radius, 1]
-        particle_id = p.createCollisionShape(p.GEOM_SPHERE, radius=particle_radius)
-        particle_ids.append(p.createMultiBody(particle_mass, particle_id, -1, pos))
-        positions.append(pos)
+# particle's parameters
+x = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # position 〇
+v = ti.Vector.field(n=2, dtype=float, shape=n_particles)  # velocity　〇
+C = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # Affine matrix　〇
+F = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # elastic deformation gradient 〇
+Fp = ti.Matrix.field(n=2, m=2, dtype=float, shape=n_particles)  # plastic deformation gradient
+# J = ti.field(dtype=float, shape=n_particles) #Jacobian determinant
+Jp = ti.field(dtype=float, shape=n_particles)  # plastic deformation　〇
 
-# バネとダンパーの定数
-spring_constant = 500
-damping_coefficient = 10
-
-# 初期距離行列の計算
-initial_distances = np.zeros((num_particles_x * num_particles_y, num_particles_x * num_particles_y))
-for i in range(num_particles_x * num_particles_y):
-    for j in range(num_particles_x * num_particles_y):
-        if i != j:
-            dist = np.linalg.norm(np.array(positions[i]) - np.array(positions[j]))
-            initial_distances[i][j] = dist
+# grid's mv and mass
+grid_v = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))  # 〇
+grid_m = ti.field(dtype=float, shape=(n_grid, n_grid))  # 〇
+grid_f = ti.Vector.field(n=2, dtype=float, shape=(n_grid, n_grid))  # 〇
 
 
-def apply_spring_damper_forces():
-    for i in range(num_particles_x * num_particles_y):
-        for j in range(i + 1, num_particles_x * num_particles_y):
-            pos_i = np.array(p.getBasePositionAndOrientation(particle_ids[i])[0])
-            pos_j = np.array(p.getBasePositionAndOrientation(particle_ids[j])[0])
-            vel_i = np.array(p.getBaseVelocity(particle_ids[i])[0])
-            vel_j = np.array(p.getBaseVelocity(particle_ids[j])[0])
+@ti.kernel
+def substep():
+    # reset grid's velocity and mass 〇
+    for i, j in grid_m:
+        grid_v[i, j] = [0, 0]
+        grid_m[i, j] = 0
 
-            distance = np.linalg.norm(pos_i - pos_j)
-            if distance < 2 * particle_radius:
-                initial_distance = initial_distances[i][j]
-                spring_force_magnitude = spring_constant * (distance - initial_distance)
-                damping_force_magnitude = damping_coefficient * np.dot(vel_j - vel_i, (pos_j - pos_i) / distance)
+    # Particle to grid: particle's mass and velocity to grid's mass and velocity
+    for p in x:
+        Xp = x[p] * inv_dx  # particle's position in grid　〇
+        base = int(Xp - 0.5).cast(int)  # the left bottom grid of particle　〇
+        fx = x[p] * inv_dx - base.cast(float)  # the distance between particle and the left bottom grid　〇
+        w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2]  # weight,use quadratic interpolation　〇
+        dw = [fx - 1.5, -2.0 * (fx - 1), fx - 0.5]  # weight's derivative　〇
+        mu, la = mu_0, lambda_0  # Lame parameters: with h
+        affine = C[p]
+        J = 1.0
 
-                total_force = (spring_force_magnitude + damping_force_magnitude) * (pos_j - pos_i) / distance
+        #for d in ti.static(range(2)):
+        #    new_sig = sig[d, d]
+        #    new_sig = ti.min(ti.max(sig[d, d], 1 - the_c), 1 + the_s)  # Plasticity
+        #    Jp[p] *= sig[d, d] / new_sig  # Plastic deformation
+        #    sig[d, d] = new_sig
+        #    J *= new_sig
+        #    F[p] = U @ sig @ V.transpose()  # Reconstruct elastic deformation gradient after plasticity
 
-                p.applyExternalForce(particle_ids[i], -1, total_force, pos_i.tolist(), p.WORLD_FRAME)
-                p.applyExternalForce(particle_ids[j], -1, -total_force, pos_j.tolist(), p.WORLD_FRAME)
+        stress = mu * (F[p] - ti.Matrix.identity(float, 2)) @ F[p].transpose() + ti.Matrix.identity(float, 2) * la * ti.log(J)
 
 
-# シミュレーションの実行
-while p.isConnected():
-    apply_spring_damper_forces()
-    p.stepSimulation()
-    time.sleep(1. / 240.)
+        for i, j in ti.static(ti.ndrange(3, 3)):  # loop over 3*3 grids around the particle
+            offset = ti.Vector([i, j])  # offset,offset is the index of the grid
+            dpos = (offset.cast(float) - fx) * dx  # dpos
+            weight = w[i].x * w[j].y  # weight,w[i][0] is the weight of x direction,w[j][1] is the weight of y direction
+
+            grid_m[base + offset] += weight * p_mass  # grid's mass
+            grid_v[base + offset] += weight * p_mass * (v[p] + affine @ dpos)
+
+            dweight = ti.Vector.zero(float, 2)
+            dweight[0] = inv_dx * dw[i][0] * w[j][1]
+            dweight[1] = inv_dx * w[i][0] * dw[j][1]
+
+            force = -p_vol * stress @ dweight  # This is doing Step 6: Add elastic force
+
+            grid_f[base + offset] += p_vol * stress @ F[p].transpose() @ dweight  # This is computing -J * p * F * grad(w)
+
+            grid_v[base + offset] += dt * force
+
+    # compute the grid's velocity and boundary conditions
+    for i, j in grid_m:
+        if grid_m[i, j] > 0:  # if the weight of the grid is not zero
+            grid_v[i, j] /= grid_m[i, j]  # grid's x velocity is the average of all particles' x velocity in the grid
+        grid_v[i, j].y -= dt * gravity  # grid's y velocity
+        if i < bound and grid_v[
+            i, j].x < 0:  # if the index of the grid is smaller than bound and the grid's x velocity is smaller than zero
+            grid_v[i, j].x = 0
+        if i > n_grid - bound and grid_v[
+            i, j].x > 0:  # if the index of the grid is bigger than n_grid - bound and the grid's x velocity is bigger than zero
+            grid_v[i, j].x = 0
+        if j < bound and grid_v[
+            i, j].y < 0:  # if the index of the grid is smaller than bound and the grid's y velocity is smaller than zero
+            grid_v[i, j].y = 0
+        if j > n_grid - bound and grid_v[
+            i, j].y > 0:  # if the index of the grid is bigger than n_grid - bound and the grid's y velocity is bigger than zero
+            grid_v[i, j].y = 0
+
+    # Grid to particle: grid's velocity to particle's velocity
+    for p in x:
+        base = (x[p] * inv_dx - 0.5).cast(int)  # the left bottom grid of particle
+        fx = x[p] * inv_dx - base.cast(float)  # the distance between particle and the left bottom grid
+        w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]  # weight,use quadratic interpolation
+        dw = [fx - 1.5, -2.0 * (fx - 1), fx - 0.5]  # weight's derivative
+
+        new_v = ti.Vector.zero(ti.f32, 2)  # new velocity
+        new_C = ti.Matrix.zero(ti.f32, 2, 2)  # new affine matrix
+        new_F = ti.Matrix.zero(float, 2, 2)
+
+        for i, j in ti.static(ti.ndrange(3, 3)):  # loop over 3*3 grids around the particle
+            offset = ti.Vector([i, j])
+            dpos = (offset - fx) * dx  # dpos is the distance between the grid and the particle
+            weight = w[i].x * w[j].y
+
+            dweight = ti.Vector.zero(float, 2)
+            dweight[0] = inv_dx * dw[i][0] * w[j][1]
+            dweight[1] = inv_dx * w[i][0] * dw[j][1]
+
+            g_v = grid_v[base + offset]
+            new_v += weight * g_v
+            new_C += 4 * weight * g_v.outer_product(
+                dpos) / dx ** 2  # outer_product is the tensor product of two vectors
+            new_F += g_v.outer_product(dweight)
+
+        v[p], C[p] = new_v, new_C
+        x[p] += dt * v[p]
+        F[p] = (ti.Matrix.identity(float, 2) + dt * new_F) @ F[p]  # deformation gradient update
+
+
+@ti.kernel
+def init():
+    for i in range(n_particles):
+        x[i] = [ti.random() * 0.3 + 0.4, ti.random() * 0.3 + 0.2]  # randomly initialize the position of particles
+        v[i] = [0, 0]  # initialize the velocity of particles
+        F[i] = ti.Matrix([[1, 0], [0, 1]])  # initialize the deformation gradient of particles
+        C[i] = ti.Matrix.zero(float, 2, 2)
+        Jp[i] = 1
+
+
+init()  # initialize the particles
+
+gui = ti.GUI("MPM_2016")
+
+# simulate 50 steps
+while gui.running and not gui.get_event(gui.ESCAPE):
+    for s in range(50):
+        substep()
+    gui.clear(0x112F41)
+    gui.circles(x.to_numpy(), radius=1.5, color=0xFFFFFF)
+    gui.show()
